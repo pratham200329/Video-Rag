@@ -1,0 +1,78 @@
+# ==========================================
+# Environment Variables & Secrets
+# ==========================================
+.env
+.env.*
+*.env
+!.env.example
+!backend/.env.example
+
+# ==========================================
+# Python
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+
+# ==========================================
+# Node & Frontend
+# ==========================================
+node_modules/
+dist/
+build/
+.vite/
+.DS_Store
+Thumbs.db
+
+# ==========================================
+# Video & Audio Media Files
+# ==========================================
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.part
+
+# ==========================================
+# Whisper Transcripts & Subtitle Outputs
+# ==========================================
+audio.json
+audio.srt
+audio.tsv
+audio.txt
+audio.vtt
+*.srt
+*.vtt
+*.tsv
+
+# ==========================================
+# Chunks, Vector Embeddings & FAISS Indexes
+# ==========================================
+chunks.json
+embedded_chunks.json
+*_chunks.json
+*_chunks_embedded.json
+*.index
+video.index
+
+# ==========================================
+# Video Uploads & Runtime Data Directories
+# ==========================================
+uploads/*
+!uploads/.gitkeep
+backend/uploads/*
+!backend/uploads/.gitkeep
