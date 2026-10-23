@@ -25,15 +25,26 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from pipeline import (
-    transcribe_audio,
-    create_chunks,
-    create_embeddings,
-    create_faiss_index,
-    retrieve_chunks,
-    retrieve_global_chunks,
-    generate_answer
-)
+try:
+    from .pipeline import (
+        transcribe_audio,
+        create_chunks,
+        create_embeddings,
+        create_faiss_index,
+        retrieve_chunks,
+        retrieve_global_chunks,
+        generate_answer
+    )
+except (ImportError, ValueError):
+    from pipeline import (
+        transcribe_audio,
+        create_chunks,
+        create_embeddings,
+        create_faiss_index,
+        retrieve_chunks,
+        retrieve_global_chunks,
+        generate_answer
+    )
 
 
 # =========================================================
