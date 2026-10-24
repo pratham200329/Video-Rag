@@ -1,4 +1,5 @@
 import os
+import time
 import json
 import subprocess
 import logging
@@ -84,8 +85,15 @@ def transcribe_audio(audio_path):
         raise FileNotFoundError(f"Audio file not found for transcription: {audio_path}")
 
     model_name = os.getenv("WHISPER_MODEL", "base").strip() or "base"
-    logger.info(f"Running Whisper on {audio_path} (model: {model_name}, output_dir: {output_dir})...")
-    print(f"Running Whisper (model: {model_name})...")
+    try:
+        audio_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
+    except Exception:
+        audio_size_mb = 0.0
+    logger.info(
+        f"[Whisper Transcription Stage] Starting Whisper on {audio_path} "
+        f"(size: {audio_size_mb:.2f} MB, model: {model_name}, output_dir: {output_dir})..."
+    )
+    print(f"Running Whisper (model: {model_name}, size: {audio_size_mb:.2f} MB)...")
 
     # Diagnostic memory logging prior to subprocess execution
     try:
@@ -94,12 +102,13 @@ def transcribe_audio(audio_path):
         rss_mb = p.memory_info().rss / (1024 * 1024)
         vm = psutil.virtual_memory()
         logger.info(
-            f"Pre-transcription memory check: backend RSS = {rss_mb:.2f} MB, "
+            f"[Whisper Memory Check] Pre-transcription: backend RSS = {rss_mb:.2f} MB, "
             f"system available = {vm.available / (1024 * 1024):.2f} MB ({vm.percent}% total used)"
         )
     except Exception as mem_e:
         logger.debug(f"Could not read memory metrics: {mem_e}")
 
+    # Build Whisper command with single-thread and explicit CPU device to avoid memory spikes
     cmd = [
         "whisper",
         audio_path,
@@ -110,22 +119,39 @@ def transcribe_audio(audio_path):
         "--output_dir",
         output_dir,
         "--output_format",
-        "json"
+        "json",
+        "--device",
+        "cpu",
+        "--threads",
+        "1"
     ]
 
+    # Constrain OpenMP/MKL thread pools in subprocess to conserve memory on 512MB RAM
+    sub_env = os.environ.copy()
+    sub_env["OMP_NUM_THREADS"] = "1"
+    sub_env["MKL_NUM_THREADS"] = "1"
+    sub_env["OPENBLAS_NUM_THREADS"] = "1"
+    sub_env["VECLIB_MAXIMUM_THREADS"] = "1"
+    sub_env["NUMEXPR_NUM_THREADS"] = "1"
+
+    start_time = time.time()
     try:
         result = subprocess.run(
             cmd,
+            env=sub_env,
             check=True,
             capture_output=True,
             text=True
         )
+        elapsed = time.time() - start_time
+        logger.info(f"[Whisper Transcription Stage] Subprocess completed in {elapsed:.2f}s.")
         if result.stdout:
-            logger.info(f"Whisper completed. Output snippet: {result.stdout.strip()[-300:]}")
+            logger.info(f"Whisper output snippet: {result.stdout.strip()[-300:]}")
     except subprocess.CalledProcessError as e:
+        elapsed = time.time() - start_time
         stderr_text = (e.stderr or "").strip()
         stdout_text = (e.stdout or "").strip()
-        logger.error(f"Whisper process failed with returncode {e.returncode}")
+        logger.error(f"[Whisper Transcription Stage] Whisper failed after {elapsed:.2f}s with exit code {e.returncode}")
         if stderr_text:
             logger.error(f"Whisper stderr:\n{stderr_text}")
         if stdout_text:

@@ -277,6 +277,34 @@ def _preflight_headers(cors_mw, origin, req_method="POST", req_headers="content-
     return dict(resp.headers)
 
 
+def _cors_simple_response_headers(cors_mw, origin, req_headers=None):
+    """
+    Simulate CORSMiddleware processing an actual simple request (GET/POST)
+    and return the response headers dictionary.
+    Synchronously steps the ASGI send coroutine without network or event loops.
+    """
+    from starlette.datastructures import Headers
+    raw = {"origin": origin}
+    if req_headers:
+        raw.update(req_headers)
+    request_headers = Headers(raw)
+    msg = {"type": "http.response.start", "status": 200, "headers": []}
+    sent = []
+
+    async def mock_send(m):
+        sent.append(m)
+
+    coro = cors_mw.send(msg, mock_send, request_headers)
+    try:
+        coro.send(None)
+    except StopIteration:
+        pass
+
+    if sent and "headers" in sent[0]:
+        return {k.decode().lower(): v.decode() for k, v in sent[0]["headers"]}
+    return {}
+
+
 class TestCORSConfiguration(unittest.TestCase):
     """Test CORSMiddleware configuration without TestClient / network stack."""
 
@@ -320,23 +348,64 @@ class TestCORSConfiguration(unittest.TestCase):
         for method in ("GET", "POST", "OPTIONS"):
             self.assertIn(method, acam,
                           f"'{method}' missing from ACAM: '{acam}'")
+        self.assertEqual(resp.headers.get("access-control-allow-credentials"), "true")
 
     # ------------------------------------------------------------------
-    # 12. is_allowed_origin — Vercel origin
+    # 12. Actual GET response headers — Vercel origin
     # ------------------------------------------------------------------
 
-    def test_12_cors_vercel_origin_is_allowed(self):
+    def test_12_cors_get_response_headers_vercel_origin(self):
+        """Actual GET response to Vercel origin must include Access-Control-Allow-Origin."""
+        headers = _cors_simple_response_headers(self.cors_mw, VERCEL_ORIGIN)
+        self.assertEqual(
+            headers.get("access-control-allow-origin"),
+            VERCEL_ORIGIN,
+            f"Missing or mismatched ACAO on GET response: {headers}"
+        )
+        self.assertEqual(
+            headers.get("access-control-allow-credentials"),
+            "true",
+            f"Missing ACAC on GET response: {headers}"
+        )
+
+    # ------------------------------------------------------------------
+    # 13. Actual POST response headers (e.g. /upload) — Vercel origin
+    # ------------------------------------------------------------------
+
+    def test_13_cors_post_upload_response_headers_vercel_origin(self):
+        """Actual POST response (/upload) to Vercel origin must include Access-Control-Allow-Origin."""
+        headers = _cors_simple_response_headers(
+            self.cors_mw,
+            VERCEL_ORIGIN,
+            req_headers={"content-type": "multipart/form-data"}
+        )
+        self.assertEqual(
+            headers.get("access-control-allow-origin"),
+            VERCEL_ORIGIN,
+            f"Missing or mismatched ACAO on POST response: {headers}"
+        )
+        self.assertEqual(
+            headers.get("access-control-allow-credentials"),
+            "true",
+            f"Missing ACAC on POST response: {headers}"
+        )
+
+    # ------------------------------------------------------------------
+    # 14. is_allowed_origin — Vercel origin
+    # ------------------------------------------------------------------
+
+    def test_14_cors_vercel_origin_is_allowed(self):
         """CORSMiddleware.is_allowed_origin() must return True for the Vercel origin."""
         allowed = self.cors_mw.is_allowed_origin(VERCEL_ORIGIN)
         self.assertTrue(allowed,
                         f"is_allowed_origin returned False for '{VERCEL_ORIGIN}'")
 
     # ------------------------------------------------------------------
-    # 13. Local dev origins still allowed (regression)
+    # 15. Local dev origins still allowed (regression)
     # ------------------------------------------------------------------
 
-    def test_13_cors_localhost_still_allowed(self):
-        """Local dev origins must still be allowed and pass preflight."""
+    def test_15_cors_localhost_still_allowed(self):
+        """Local dev origins must still receive correct CORS headers on preflight and simple requests."""
         for origin in ("http://localhost:5173", "http://127.0.0.1:5173"):
             allowed = self.cors_mw.is_allowed_origin(origin)
             self.assertTrue(allowed, f"Local origin '{origin}' is not allowed")
@@ -349,12 +418,15 @@ class TestCORSConfiguration(unittest.TestCase):
             self.assertEqual(resp.status_code, 200)
             self.assertEqual(resp.headers.get("access-control-allow-origin"), origin)
 
+            simple_h = _cors_simple_response_headers(self.cors_mw, origin)
+            self.assertEqual(simple_h.get("access-control-allow-origin"), origin)
+
     # ------------------------------------------------------------------
-    # 14. Unknown origin blocked
+    # 16. Unknown origin blocked
     # ------------------------------------------------------------------
 
-    def test_14_cors_unknown_origin_blocked(self):
-        """Unknown origins must NOT be allowed by the middleware and preflight must fail."""
+    def test_16_cors_unknown_origin_blocked(self):
+        """Unknown origins must NOT receive ACAO and preflight must fail with 400."""
         rogue = "https://evil.example.com"
         allowed = self.cors_mw.is_allowed_origin(rogue)
         self.assertFalse(allowed,
@@ -368,11 +440,14 @@ class TestCORSConfiguration(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertNotIn("access-control-allow-origin", resp.headers)
 
+        simple_h = _cors_simple_response_headers(self.cors_mw, rogue)
+        self.assertNotIn("access-control-allow-origin", simple_h)
+
     # ------------------------------------------------------------------
-    # 15. Runtime CORS_ORIGINS env var merging
+    # 17. Runtime CORS_ORIGINS env var merging
     # ------------------------------------------------------------------
 
-    def test_15_cors_runtime_origin_via_env_var(self):
+    def test_17_cors_runtime_origin_via_env_var(self):
         """Extra origins from CORS_ORIGINS env var should be merged into allowed list."""
         extra = "https://preview-branch.vercel.app"
         import backend.main as main_mod
@@ -390,6 +465,9 @@ class TestCORSConfiguration(unittest.TestCase):
         runtime_mw = _make_cors_mw(dynamic)
         self.assertTrue(runtime_mw.is_allowed_origin(extra),
                         f"Runtime CORS middleware does not allow '{extra}'")
+
+        runtime_h = _cors_simple_response_headers(runtime_mw, extra)
+        self.assertEqual(runtime_h.get("access-control-allow-origin"), extra)
 
 
 if __name__ == "__main__":

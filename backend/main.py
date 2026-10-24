@@ -314,11 +314,14 @@ async def upload_video(
         embeddings_path = os.path.join(UPLOAD_DIR, base_name + "_chunks_embedded.json")
         index_path = os.path.join(UPLOAD_DIR, base_name + "_chunks_embedded.index")
 
-        logger.info(f"Initiating upload for video: {file.filename}")
+        logger.info(f"[Upload Stage 1/6: Save Video] Initiating upload for video: {file.filename}")
 
         # 1. Save video
         with open(video_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+
+        file_size_mb = os.path.getsize(video_path) / (1024 * 1024) if os.path.exists(video_path) else 0
+        logger.info(f"[Upload Stage 1/6: Save Video] Saved {file.filename} ({file_size_mb:.2f} MB)")
 
         file_hash = get_file_hash(video_path)
 
@@ -336,7 +339,7 @@ async def upload_video(
             and existing.get("faiss_index_path")
             and os.path.exists(existing.get("faiss_index_path", ""))
         ):
-            logger.info(f"Video {file.filename} already indexed. Returning cached metadata.")
+            logger.info(f"[Upload Cache] Video {file.filename} already indexed. Returning cached metadata.")
             print(f"Video {file.filename} already indexed. Returning cached metadata.")
             return {
                 **existing,
@@ -345,10 +348,10 @@ async def upload_video(
 
         # 2. Extract audio with FFmpeg
         if os.path.exists(audio_path):
-            logger.info("Audio already exists. Skipping FFmpeg.")
+            logger.info("[Upload Stage 2/6: Audio Extraction] Audio already exists. Skipping FFmpeg.")
             print("Audio already exists. Skipping FFmpeg.")
         else:
-            logger.info(f"Extracting audio from {video_path}...")
+            logger.info(f"[Upload Stage 2/6: Audio Extraction] Extracting audio from {video_path}...")
             print("Extracting audio...")
             try:
                 subprocess.run(
@@ -370,24 +373,26 @@ async def upload_video(
                     text=True,
                     stdin=subprocess.DEVNULL
                 )
+                logger.info(f"[Upload Stage 2/6: Audio Extraction] FFmpeg extracted audio to {audio_path}")
             except subprocess.CalledProcessError as ff_err:
-                logger.error(f"FFmpeg audio extraction failed (exit {ff_err.returncode}): {ff_err.stderr}")
+                logger.error(f"[Upload Stage 2/6: Audio Extraction] FFmpeg failed (exit {ff_err.returncode}): {ff_err.stderr}")
                 raise RuntimeError(f"FFmpeg audio extraction failed: {ff_err.stderr or ff_err}") from ff_err
 
         # 3. Whisper speech-to-text
-        logger.info(f"Starting Whisper transcription for {audio_path}...")
+        logger.info(f"[Upload Stage 3/6: Audio Transcription] Starting Whisper transcription for {audio_path}...")
         json_path = transcribe_audio(audio_path)
+        logger.info(f"[Upload Stage 3/6: Audio Transcription] Completed: {json_path}")
 
         # 4. Chunking
-        logger.info(f"Generating chunks for {json_path}...")
+        logger.info(f"[Upload Stage 4/6: Text Chunking] Generating chunks for {json_path}...")
         chunks_path = create_chunks(json_path)
 
         # 5. Embeddings
-        logger.info(f"Generating embeddings for {chunks_path}...")
+        logger.info(f"[Upload Stage 5/6: Embedding Generation] Generating embeddings for {chunks_path}...")
         embeddings_path = create_embeddings(chunks_path)
 
         # 6. FAISS index
-        logger.info(f"Creating FAISS vector index for {embeddings_path}...")
+        logger.info(f"[Upload Stage 6/6: Vector Indexing] Creating FAISS vector index for {embeddings_path}...")
         index_path = create_faiss_index(embeddings_path)
 
         # 7. Register in persistent library catalog
