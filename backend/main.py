@@ -119,27 +119,41 @@ os.makedirs(
 # CORS
 # =========================================================
 
-allowed_origins = [
+# Built-in allowed origins: local dev + known production frontends.
+# To add more origins at deploy time, set the CORS_ORIGINS env var as a
+# comma-separated list, e.g.:
+#   CORS_ORIGINS=https://my-app.vercel.app,https://custom-domain.com
+_BUILTIN_ORIGINS = [
+    # Local development
     "http://localhost:5173",
-    "http://127.0.0.1:5173"
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    # Production Vercel frontend
+    "https://frontend-theta-lemon-qnvdcsvxf.vercel.app",
 ]
-custom_origins = os.getenv("CORS_ORIGINS", "").strip()
-if custom_origins:
-    for o in custom_origins.split(","):
-        o = o.strip()
-        if o and o not in allowed_origins:
-            allowed_origins.append(o)
+
+allowed_origins = list(_BUILTIN_ORIGINS)  # mutable copy
+
+# Merge any runtime-configured origins (e.g. custom domains, PR previews)
+_custom_origins_env = os.getenv("CORS_ORIGINS", "").strip()
+if _custom_origins_env:
+    for _o in _custom_origins_env.split(","):
+        _o = _o.strip().rstrip("/")
+        if _o and _o not in allowed_origins:
+            allowed_origins.append(_o)
+            logger.info(f"CORS: added runtime origin '{_o}' from CORS_ORIGINS env var")
+
+logger.info(f"CORS: allowed origins = {allowed_origins}")
 
 app.add_middleware(
     CORSMiddleware,
-
     allow_origins=allowed_origins,
-
     allow_credentials=True,
-
     allow_methods=["*"],
-
-    allow_headers=["*"]
+    allow_headers=["*"],
+    expose_headers=["Content-Length", "Content-Range"],
+    max_age=600,  # preflight cache: 10 minutes
 )
 
 

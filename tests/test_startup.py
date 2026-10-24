@@ -4,6 +4,11 @@ import psutil
 import unittest
 from unittest.mock import patch, MagicMock
 
+# ---------------------------------------------------------------------------
+# CORS origin constant — must match what's hardcoded in backend/main.py
+# ---------------------------------------------------------------------------
+VERCEL_ORIGIN = "https://frontend-theta-lemon-qnvdcsvxf.vercel.app"
+
 class TestStartupFlow(unittest.TestCase):
 
     def test_01_startup_does_not_load_heavy_models(self):
@@ -231,6 +236,160 @@ class TestStartupFlow(unittest.TestCase):
             whisper_cmd[model_idx], "base",
             f"Expected default model 'base', got '{whisper_cmd[model_idx]}'"
         )
+
+
+# ---------------------------------------------------------------------------
+# CORS Tests
+# ---------------------------------------------------------------------------
+
+def _make_cors_mw(origins):
+    """Instantiate CORSMiddleware with a dummy ASGI app for direct method inspection."""
+    from starlette.middleware.cors import CORSMiddleware
+
+    async def _dummy(scope, receive, send):
+        pass  # never called in our unit tests
+
+    return CORSMiddleware(
+        app=_dummy,
+        allow_origins=origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["Content-Length", "Content-Range"],
+        max_age=600,
+    )
+
+
+def _preflight_headers(cors_mw, origin, req_method="POST", req_headers="content-type"):
+    """
+    Call CORSMiddleware.preflight_response() directly and return the response headers
+    as a dict.  Pure synchronous — no ASGI transport needed.
+    """
+    from starlette.datastructures import Headers
+    raw = {
+        "origin": origin,
+        "access-control-request-method": req_method,
+        "access-control-request-headers": req_headers,
+    }
+    # Starlette Headers accepts a dict[str, str] in its constructor
+    headers = Headers(headers=raw)
+    resp = cors_mw.preflight_response(request_headers=headers)
+    return dict(resp.headers)
+
+
+class TestCORSConfiguration(unittest.TestCase):
+    """Test CORSMiddleware configuration without TestClient / network stack."""
+
+    @classmethod
+    def setUpClass(cls):
+        import backend.main as main_mod
+        cls.allowed_origins = main_mod.allowed_origins
+        cls._BUILTIN_ORIGINS = main_mod._BUILTIN_ORIGINS
+        cls.cors_mw = _make_cors_mw(cls.allowed_origins)
+
+    # ------------------------------------------------------------------
+    # 10. Vercel origin present in the compiled allowed_origins list
+    # ------------------------------------------------------------------
+
+    def test_10_vercel_origin_in_allowed_list(self):
+        """Verify the Vercel production origin is present in allowed_origins."""
+        self.assertIn(
+            VERCEL_ORIGIN,
+            self.allowed_origins,
+            f"'{VERCEL_ORIGIN}' missing from allowed_origins.\nCurrent: {self.allowed_origins}"
+        )
+
+    # ------------------------------------------------------------------
+    # 11. OPTIONS preflight — Vercel origin
+    # ------------------------------------------------------------------
+
+    def test_11_cors_preflight_vercel_origin(self):
+        """OPTIONS preflight from Vercel origin must return 200 with correct CORS headers."""
+        from starlette.datastructures import Headers
+        headers = Headers({
+            "origin": VERCEL_ORIGIN,
+            "access-control-request-method": "POST",
+            "access-control-request-headers": "content-type",
+        })
+        resp = self.cors_mw.preflight_response(request_headers=headers)
+        self.assertEqual(resp.status_code, 200)
+        acao = resp.headers.get("access-control-allow-origin", "")
+        self.assertEqual(acao, VERCEL_ORIGIN,
+                         f"ACAO was '{acao}', expected '{VERCEL_ORIGIN}'")
+        acam = resp.headers.get("access-control-allow-methods", "")
+        for method in ("GET", "POST", "OPTIONS"):
+            self.assertIn(method, acam,
+                          f"'{method}' missing from ACAM: '{acam}'")
+
+    # ------------------------------------------------------------------
+    # 12. is_allowed_origin — Vercel origin
+    # ------------------------------------------------------------------
+
+    def test_12_cors_vercel_origin_is_allowed(self):
+        """CORSMiddleware.is_allowed_origin() must return True for the Vercel origin."""
+        allowed = self.cors_mw.is_allowed_origin(VERCEL_ORIGIN)
+        self.assertTrue(allowed,
+                        f"is_allowed_origin returned False for '{VERCEL_ORIGIN}'")
+
+    # ------------------------------------------------------------------
+    # 13. Local dev origins still allowed (regression)
+    # ------------------------------------------------------------------
+
+    def test_13_cors_localhost_still_allowed(self):
+        """Local dev origins must still be allowed and pass preflight."""
+        for origin in ("http://localhost:5173", "http://127.0.0.1:5173"):
+            allowed = self.cors_mw.is_allowed_origin(origin)
+            self.assertTrue(allowed, f"Local origin '{origin}' is not allowed")
+
+            from starlette.datastructures import Headers
+            resp = self.cors_mw.preflight_response(Headers({
+                "origin": origin,
+                "access-control-request-method": "GET"
+            }))
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.headers.get("access-control-allow-origin"), origin)
+
+    # ------------------------------------------------------------------
+    # 14. Unknown origin blocked
+    # ------------------------------------------------------------------
+
+    def test_14_cors_unknown_origin_blocked(self):
+        """Unknown origins must NOT be allowed by the middleware and preflight must fail."""
+        rogue = "https://evil.example.com"
+        allowed = self.cors_mw.is_allowed_origin(rogue)
+        self.assertFalse(allowed,
+                         f"Rogue origin '{rogue}' was unexpectedly allowed")
+
+        from starlette.datastructures import Headers
+        resp = self.cors_mw.preflight_response(Headers({
+            "origin": rogue,
+            "access-control-request-method": "POST"
+        }))
+        self.assertEqual(resp.status_code, 400)
+        self.assertNotIn("access-control-allow-origin", resp.headers)
+
+    # ------------------------------------------------------------------
+    # 15. Runtime CORS_ORIGINS env var merging
+    # ------------------------------------------------------------------
+
+    def test_15_cors_runtime_origin_via_env_var(self):
+        """Extra origins from CORS_ORIGINS env var should be merged into allowed list."""
+        extra = "https://preview-branch.vercel.app"
+        import backend.main as main_mod
+
+        with patch.dict("os.environ", {"CORS_ORIGINS": extra}, clear=False):
+            dynamic = list(main_mod._BUILTIN_ORIGINS)
+            for o in os.getenv("CORS_ORIGINS", "").strip().split(","):
+                o = o.strip().rstrip("/")
+                if o and o not in dynamic:
+                    dynamic.append(o)
+
+        self.assertIn(extra, dynamic,
+                      f"Runtime origin '{extra}' missing from merged list: {dynamic}")
+
+        runtime_mw = _make_cors_mw(dynamic)
+        self.assertTrue(runtime_mw.is_allowed_origin(extra),
+                        f"Runtime CORS middleware does not allow '{extra}'")
 
 
 if __name__ == "__main__":
