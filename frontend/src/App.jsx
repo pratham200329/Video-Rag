@@ -1,6 +1,10 @@
 import { useState, useRef, useEffect } from "react";
 
-const API_URL = "http://127.0.0.1:8000";
+// Normalize API base URL from Vite environment variable with local fallback
+const RAW_API_BASE = import.meta.env.VITE_API_BASE_URL;
+const API_URL = (RAW_API_BASE && typeof RAW_API_BASE === "string" && RAW_API_BASE.trim())
+  ? RAW_API_BASE.trim().replace(/\/+$/, "")
+  : "http://127.0.0.1:8000";
 
 // Helper component for markdown rendering without external dependencies
 function FormattedMessage({ text }) {
