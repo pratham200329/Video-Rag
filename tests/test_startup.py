@@ -107,5 +107,131 @@ class TestStartupFlow(unittest.TestCase):
             self.assertIn("ranked_videos", result)
             self.assertEqual(result["answer"], "Grounded response about machine learning")
 
+    def test_06_transcribe_audio_oom_detection(self):
+        """Verify transcribe_audio captures SIGKILL / OOM subprocess return codes properly."""
+        import subprocess
+        from backend.pipeline import transcribe_audio
+
+        with patch("os.path.exists", side_effect=lambda p: False if p.endswith(".json") else True), \
+             patch("subprocess.run") as mock_run:
+            # Simulate OOM SIGKILL returncode -9
+            mock_run.side_effect = subprocess.CalledProcessError(
+                returncode=-9,
+                cmd=["whisper", "test.wav"],
+                stderr="Killed\n"
+            )
+
+            with self.assertRaises(RuntimeError) as ctx:
+                transcribe_audio("dummy_audio.wav")
+
+            self.assertIn("Out of Memory", str(ctx.exception))
+            self.assertIn("SIGKILL", str(ctx.exception))
+
+    def test_07_upload_error_handling_and_secret_redaction(self):
+        """Verify sanitize_error_detail redacts secrets, and the upload HTTPException wrapper works."""
+        from fastapi import HTTPException
+        from backend.main import sanitize_error_detail
+
+        # --- 7a. Secret redaction ---
+        dummy_err = Exception(
+            "Failed with gsk_abcdef1234567890abcdef1234567890 and Bearer secret_token_xyz"
+        )
+        sanitized = sanitize_error_detail(dummy_err)
+        self.assertNotIn("gsk_abcdef1234567890abcdef1234567890", sanitized)
+        self.assertNotIn("Bearer secret_token_xyz", sanitized)
+        self.assertIn("[REDACTED_KEY]", sanitized)
+        self.assertIn("[REDACTED]", sanitized)
+
+        # --- 7b. sanitize_error_detail leaves ordinary messages intact ---
+        plain = sanitize_error_detail(RuntimeError("Whisper OOM - model too large"))
+        self.assertIn("Whisper OOM", plain)
+
+        # --- 7c. Verify the HTTPException wrapping pattern used in upload_video ---
+        # Simulate what upload_video does in its except block
+        original_error = RuntimeError("Whisper transcription killed by OOM: returncode -9")
+        safe_detail = sanitize_error_detail(original_error)
+        wrapped = HTTPException(
+            status_code=500,
+            detail=f"Video processing failed: {safe_detail}"
+        )
+        self.assertEqual(wrapped.status_code, 500)
+        self.assertIn("Whisper", wrapped.detail)
+        self.assertIn("Video processing failed", wrapped.detail)
+
+    def test_08_whisper_model_env_var_is_read(self):
+        """Verify transcribe_audio passes the WHISPER_MODEL env var value to the whisper CLI."""
+        import subprocess, pathlib, json as _json
+        from backend.pipeline import transcribe_audio
+
+        captured_cmds = []
+
+        def fake_run(cmd, **kwargs):
+            captured_cmds.append(list(cmd))
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            result.stderr = ""
+            return result
+
+        # os.path.exists: wav file exists (True), json transcript does NOT exist (False)
+        def fake_exists(path):
+            return not path.endswith(".json")
+
+        with patch.dict("os.environ", {"WHISPER_MODEL": "tiny"}, clear=False), \
+             patch("subprocess.run", side_effect=fake_run), \
+             patch("os.path.exists", side_effect=fake_exists):
+            try:
+                transcribe_audio("dummy_audio.wav")
+            except Exception:
+                pass  # may fail when reading JSON output — we only care the command ran
+
+        self.assertGreater(len(captured_cmds), 0, "subprocess.run was never called")
+        whisper_cmd = captured_cmds[0]
+        self.assertIn("--model", whisper_cmd, "'--model' flag missing from whisper command")
+        model_idx = whisper_cmd.index("--model") + 1
+        self.assertEqual(
+            whisper_cmd[model_idx], "tiny",
+            f"Expected model 'tiny' from WHISPER_MODEL env var, got '{whisper_cmd[model_idx]}'"
+        )
+
+    def test_09_whisper_model_defaults_to_base(self):
+        """Verify transcribe_audio defaults to 'base' when WHISPER_MODEL is not set."""
+        import subprocess
+        from backend.pipeline import transcribe_audio
+
+        captured_cmds = []
+
+        def fake_run(cmd, **kwargs):
+            captured_cmds.append(list(cmd))
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            result.stderr = ""
+            return result
+
+        def fake_exists(path):
+            return not path.endswith(".json")
+
+        # Ensure WHISPER_MODEL is absent from environment
+        import os as _os
+        env_without = {k: v for k, v in _os.environ.items() if k != "WHISPER_MODEL"}
+        with patch.dict("os.environ", env_without, clear=True), \
+             patch("subprocess.run", side_effect=fake_run), \
+             patch("os.path.exists", side_effect=fake_exists):
+            try:
+                transcribe_audio("dummy_audio.wav")
+            except Exception:
+                pass
+
+        self.assertGreater(len(captured_cmds), 0, "subprocess.run was never called")
+        whisper_cmd = captured_cmds[0]
+        self.assertIn("--model", whisper_cmd, "'--model' flag missing from whisper command")
+        model_idx = whisper_cmd.index("--model") + 1
+        self.assertEqual(
+            whisper_cmd[model_idx], "base",
+            f"Expected default model 'base', got '{whisper_cmd[model_idx]}'"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

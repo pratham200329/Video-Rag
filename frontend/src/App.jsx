@@ -422,7 +422,8 @@ function App() {
       });
 
       if (!response.ok) {
-        throw new Error("Upload failed");
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.detail || "Video processing failed. Please verify the backend connection.");
       }
 
       const data = await response.json();
@@ -434,7 +435,7 @@ function App() {
 
     } catch (err) {
       console.error(err);
-      setError("Video processing failed. Please verify the backend connection.");
+      setError(err.message || "Video processing failed. Please verify the backend connection.");
     } finally {
       setUploading(false);
     }

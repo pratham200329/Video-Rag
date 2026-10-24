@@ -1,6 +1,7 @@
 import os
 import json
 import subprocess
+import logging
 
 import numpy as np
 from dotenv import load_dotenv
@@ -12,6 +13,8 @@ from groq import (
     APIConnectionError,
     APITimeoutError,
 )
+
+logger = logging.getLogger("videorag.pipeline")
 
 # Load environment variables
 load_dotenv()
@@ -66,37 +69,102 @@ def __getattr__(name: str):
 # =========================================================
 
 def transcribe_audio(audio_path):
-
     output_dir = os.path.dirname(audio_path)
-
+    base_name = os.path.splitext(os.path.basename(audio_path))[0]
     json_path = os.path.splitext(audio_path)[0] + ".json"
 
     # Already transcribed?
     if os.path.exists(json_path):
-
+        logger.info(f"Transcript already exists at {json_path}. Skipping Whisper.")
         print("Transcript already exists. Skipping Whisper.")
-
         return json_path
 
+    if not os.path.exists(audio_path):
+        logger.error(f"Audio file does not exist: {audio_path}")
+        raise FileNotFoundError(f"Audio file not found for transcription: {audio_path}")
 
-    print("Running Whisper...")
+    model_name = os.getenv("WHISPER_MODEL", "base").strip() or "base"
+    logger.info(f"Running Whisper on {audio_path} (model: {model_name}, output_dir: {output_dir})...")
+    print(f"Running Whisper (model: {model_name})...")
 
-    subprocess.run(
-        [
-            "whisper",
-            audio_path,
-            "--model",
-            "base",
-            "--language",
-            "English",
-            "--output_dir",
-            output_dir,
-            "--output_format",
-            "json"
-        ],
-        check=True
-    )
+    # Diagnostic memory logging prior to subprocess execution
+    try:
+        import psutil
+        p = psutil.Process()
+        rss_mb = p.memory_info().rss / (1024 * 1024)
+        vm = psutil.virtual_memory()
+        logger.info(
+            f"Pre-transcription memory check: backend RSS = {rss_mb:.2f} MB, "
+            f"system available = {vm.available / (1024 * 1024):.2f} MB ({vm.percent}% total used)"
+        )
+    except Exception as mem_e:
+        logger.debug(f"Could not read memory metrics: {mem_e}")
 
+    cmd = [
+        "whisper",
+        audio_path,
+        "--model",
+        model_name,
+        "--language",
+        "English",
+        "--output_dir",
+        output_dir,
+        "--output_format",
+        "json"
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        if result.stdout:
+            logger.info(f"Whisper completed. Output snippet: {result.stdout.strip()[-300:]}")
+    except subprocess.CalledProcessError as e:
+        stderr_text = (e.stderr or "").strip()
+        stdout_text = (e.stdout or "").strip()
+        logger.error(f"Whisper process failed with returncode {e.returncode}")
+        if stderr_text:
+            logger.error(f"Whisper stderr:\n{stderr_text}")
+        if stdout_text:
+            logger.info(f"Whisper stdout tail:\n{stdout_text[-500:]}")
+
+        # Distinguish SIGKILL (OOM) vs SIGTERM (Timeout) vs error exit
+        if e.returncode in (-9, 137):
+            err_msg = (
+                f"Whisper transcription was killed by the operating system (return code {e.returncode} - SIGKILL/Out of Memory). "
+                f"Transcribing audio with model '{model_name}' exceeded the container's available RAM limit."
+            )
+            logger.error(err_msg)
+            raise RuntimeError(err_msg) from e
+        elif e.returncode in (-15, 143):
+            err_msg = (
+                f"Whisper transcription was terminated by SIGTERM (return code {e.returncode}). "
+                f"The transcription operation likely exceeded the execution timeout."
+            )
+            logger.error(err_msg)
+            raise RuntimeError(err_msg) from e
+        else:
+            snippet = stderr_text[-300:] if stderr_text else f"exit code {e.returncode}"
+            err_msg = f"Whisper transcription failed ({snippet})"
+            logger.error(err_msg)
+            raise RuntimeError(err_msg) from e
+    except FileNotFoundError as e:
+        logger.error(f"Whisper executable not found in PATH: {e}")
+        raise RuntimeError("Whisper CLI is not installed or not found in system PATH.") from e
+
+    # Verify expected json transcript exists
+    if not os.path.exists(json_path):
+        alt_candidate = os.path.join(output_dir, f"{base_name}.json")
+        if os.path.exists(alt_candidate):
+            json_path = alt_candidate
+        else:
+            logger.error(f"Whisper finished but transcript was not found at {json_path}")
+            raise FileNotFoundError(f"Whisper transcript output file not found at {json_path}")
+
+    logger.info(f"Whisper transcription generated successfully: {json_path}")
     return json_path
 
 
@@ -105,134 +173,71 @@ def transcribe_audio(audio_path):
 # =========================================================
 
 def create_chunks(json_path):
-
-    chunks_path = (
-        os.path.splitext(json_path)[0]
-        + "_chunks.json"
-    )
-
+    chunks_path = os.path.splitext(json_path)[0] + "_chunks.json"
 
     # Already chunked?
     if os.path.exists(chunks_path):
-
-        print(
-            "Chunks already exist. "
-            "Skipping chunking."
-        )
-
+        logger.info(f"Chunks already exist at {chunks_path}. Skipping chunking.")
+        print("Chunks already exist. Skipping chunking.")
         return chunks_path
 
-
+    logger.info(f"Creating chunks from transcript {json_path}...")
     print("Creating chunks...")
 
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        logger.exception(f"Failed to load transcript JSON from {json_path}: {e}")
+        raise RuntimeError(f"Failed to read transcript JSON file: {e}") from e
 
-    with open(
-        json_path,
-        "r",
-        encoding="utf-8"
-    ) as f:
-
-        data = json.load(f)
-
-
-    segments = data["segments"]
-
+    segments = data.get("segments", [])
+    if not segments and data.get("text"):
+        segments = [{"start": 0.0, "end": 1.0, "text": data["text"].strip()}]
 
     MAX_CHARS = 500
-
     chunks = []
-
     current_text = []
-
     current_start = None
-
     current_end = None
-
     current_length = 0
 
-
     for segment in segments:
-
-        text = segment["text"].strip()
-
+        text = segment.get("text", "").strip()
         if not text:
             continue
 
-
         if current_start is None:
-
-            current_start = segment["start"]
-
+            current_start = segment.get("start", 0.0)
 
         current_text.append(text)
-
-        current_end = segment["end"]
-
+        current_end = segment.get("end", current_start)
         current_length += len(text)
 
-
         if current_length >= MAX_CHARS:
-
-            chunks.append(
-                {
-                    "text":
-                        " ".join(current_text),
-
-                    "start":
-                        current_start,
-
-                    "end":
-                        current_end
-                }
-            )
-
-
+            chunks.append({
+                "text": " ".join(current_text),
+                "start": current_start,
+                "end": current_end
+            })
             current_text = []
-
             current_start = None
-
             current_end = None
-
             current_length = 0
 
-
     # Remaining text
-
     if current_text:
+        chunks.append({
+            "text": " ".join(current_text),
+            "start": current_start,
+            "end": current_end
+        })
 
-        chunks.append(
-            {
-                "text":
-                    " ".join(current_text),
+    with open(chunks_path, "w", encoding="utf-8") as f:
+        json.dump(chunks, f, indent=2, ensure_ascii=False)
 
-                "start":
-                    current_start,
-
-                "end":
-                    current_end
-            }
-        )
-
-
-    with open(
-        chunks_path,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            chunks,
-            f,
-            indent=2,
-            ensure_ascii=False
-        )
-
-
-    print(
-        f"Created {len(chunks)} chunks."
-    )
-
-
+    logger.info(f"Created {len(chunks)} chunks in {chunks_path}")
+    print(f"Created {len(chunks)} chunks.")
     return chunks_path
 
 
@@ -241,84 +246,44 @@ def create_chunks(json_path):
 # =========================================================
 
 def create_embeddings(chunks_path):
-
-    embeddings_path = (
-        os.path.splitext(chunks_path)[0]
-        + "_embedded.json"
-    )
-
+    embeddings_path = os.path.splitext(chunks_path)[0] + "_embedded.json"
 
     # Already embedded?
     if os.path.exists(embeddings_path):
-
-        print(
-            "Embeddings already exist. "
-            "Skipping embedding generation."
-        )
-
+        logger.info(f"Embeddings already exist at {embeddings_path}. Skipping embedding generation.")
+        print("Embeddings already exist. Skipping embedding generation.")
         return embeddings_path
 
-
+    logger.info(f"Generating embeddings from {chunks_path}...")
     print("Creating embeddings...")
 
+    try:
+        with open(chunks_path, "r", encoding="utf-8") as f:
+            chunks = json.load(f)
+    except Exception as e:
+        logger.exception(f"Failed to read chunks JSON from {chunks_path}: {e}")
+        raise RuntimeError(f"Failed to read chunks JSON file: {e}") from e
 
-    with open(
-        chunks_path,
-        "r",
-        encoding="utf-8"
-    ) as f:
-
-        chunks = json.load(f)
-
-
-    texts = [
-        chunk["text"]
-        for chunk in chunks
-    ]
-
+    texts = [chunk.get("text", "") for chunk in chunks if chunk.get("text")]
+    if not texts:
+        logger.warning(f"No text found in chunks for {chunks_path}. Writing empty embeddings.")
+        with open(embeddings_path, "w", encoding="utf-8") as f:
+            json.dump([], f)
+        return embeddings_path
 
     model = get_embedding_model()
-    embeddings = model.encode(
-        texts,
-        show_progress_bar=True
-    )
+    embeddings = model.encode(texts, show_progress_bar=False)
 
+    for chunk, embedding in zip(chunks, embeddings):
+        chunk["embedding"] = embedding.tolist()
 
-    for chunk, embedding in zip(
-        chunks,
-        embeddings
-    ):
+    with open(embeddings_path, "w", encoding="utf-8") as f:
+        json.dump(chunks, f, indent=2, ensure_ascii=False)
 
-        chunk["embedding"] = (
-            embedding.tolist()
-        )
-
-
-    with open(
-        embeddings_path,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            chunks,
-            f,
-            indent=2,
-            ensure_ascii=False
-        )
-
-
-    print(
-        f"Created embeddings for "
-        f"{len(chunks)} chunks."
-    )
-
-    print(
-        f"Vector dimension: "
-        f"{len(embeddings[0])}"
-    )
-
-
+    dim = len(embeddings[0]) if len(embeddings) > 0 else 0
+    logger.info(f"Created embeddings for {len(chunks)} chunks (vector dimension: {dim})")
+    print(f"Created embeddings for {len(chunks)} chunks.")
+    print(f"Vector dimension: {dim}")
     return embeddings_path
 
 
@@ -326,79 +291,53 @@ def create_embeddings(chunks_path):
 # 4. FAISS INDEX
 # =========================================================
 
-def create_faiss_index(
-    embeddings_path
-):
-
-    index_path = (
-        os.path.splitext(embeddings_path)[0]
-        + ".index"
-    )
-
+def create_faiss_index(embeddings_path):
+    index_path = os.path.splitext(embeddings_path)[0] + ".index"
 
     # Already indexed?
     if os.path.exists(index_path):
-
-        print(
-            "FAISS index already exists. "
-            "Skipping index creation."
-        )
-
+        logger.info(f"FAISS index already exists at {index_path}. Skipping index creation.")
+        print("FAISS index already exists. Skipping index creation.")
         return index_path
 
-
+    logger.info(f"Creating FAISS index from {embeddings_path}...")
     print("Creating FAISS index...")
 
+    try:
+        with open(embeddings_path, "r", encoding="utf-8") as f:
+            chunks = json.load(f)
+    except Exception as e:
+        logger.exception(f"Failed to read embeddings JSON from {embeddings_path}: {e}")
+        raise RuntimeError(f"Failed to read embeddings JSON file: {e}") from e
 
-    with open(
-        embeddings_path,
-        "r",
-        encoding="utf-8"
-    ) as f:
+    faiss = get_faiss()
 
-        chunks = json.load(f)
-
+    if not chunks:
+        logger.warning(f"No embeddings found in {embeddings_path}. Writing empty FAISS index (dim 384).")
+        index = faiss.IndexFlatL2(384)
+        faiss.write_index(index, index_path)
+        return index_path
 
     vectors = np.array(
-        [
-            chunk["embedding"]
-            for chunk in chunks
-        ],
+        [chunk["embedding"] for chunk in chunks if "embedding" in chunk],
         dtype="float32"
     )
 
+    if vectors.size == 0 or len(vectors.shape) < 2:
+        logger.warning(f"Embedding vectors empty in {embeddings_path}. Writing empty FAISS index (dim 384).")
+        index = faiss.IndexFlatL2(384)
+        faiss.write_index(index, index_path)
+        return index_path
 
     dimension = vectors.shape[1]
-
-
-    faiss = get_faiss()
-    index = faiss.IndexFlatL2(
-        dimension
-    )
-
-
+    index = faiss.IndexFlatL2(dimension)
     index.add(vectors)
+    faiss.write_index(index, index_path)
 
-
-    faiss.write_index(
-        index,
-        index_path
-    )
-
-
-    print(
-        "FAISS index created."
-    )
-
-    print(
-        f"Vectors stored: {index.ntotal}"
-    )
-
-    print(
-        f"Vector dimension: {dimension}"
-    )
-
-
+    logger.info(f"FAISS index created at {index_path} ({index.ntotal} vectors, dimension {dimension}).")
+    print("FAISS index created.")
+    print(f"Vectors stored: {index.ntotal}")
+    print(f"Vector dimension: {dimension}")
     return index_path
 
 

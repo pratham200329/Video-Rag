@@ -1,19 +1,39 @@
 import os
 import re
+import json
+import time
+import hashlib
+import shutil
+import subprocess
+import logging
+import traceback
+import yt_dlp
+from typing import Optional, List, Dict, Any
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
-import json
-import time
-import hashlib
-import shutil
-import subprocess
-import yt_dlp
-from typing import Optional, List, Dict, Any
-from pydantic import BaseModel
+
+logger = logging.getLogger("videorag.backend")
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    )
+
+
+def sanitize_error_detail(err: Exception) -> str:
+    """Return a descriptive, safe error message without leaking sensitive credentials or tokens."""
+    msg = str(err)
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    if groq_key and len(groq_key) > 5 and groq_key in msg:
+        msg = msg.replace(groq_key, "[REDACTED_KEY]")
+    msg = re.sub(r'gsk_[A-Za-z0-9_-]{20,}', '[REDACTED_KEY]', msg)
+    msg = re.sub(r'Bearer\s+[A-Za-z0-9._-]+', 'Bearer [REDACTED]', msg)
+    return msg
 
 from fastapi import (
     FastAPI,
@@ -271,98 +291,127 @@ def get_videos():
 async def upload_video(
     file: UploadFile = File(...)
 ):
-    base_name = os.path.splitext(file.filename)[0]
-    video_path = os.path.join(UPLOAD_DIR, file.filename)
-    audio_path = os.path.join(UPLOAD_DIR, base_name + ".wav")
-    json_path = os.path.join(UPLOAD_DIR, base_name + ".json")
-    chunks_path = os.path.join(UPLOAD_DIR, base_name + "_chunks.json")
-    embeddings_path = os.path.join(UPLOAD_DIR, base_name + "_chunks_embedded.json")
-    index_path = os.path.join(UPLOAD_DIR, base_name + "_chunks_embedded.index")
+    try:
+        base_name = os.path.splitext(file.filename)[0]
+        video_path = os.path.join(UPLOAD_DIR, file.filename)
+        audio_path = os.path.join(UPLOAD_DIR, base_name + ".wav")
+        json_path = os.path.join(UPLOAD_DIR, base_name + ".json")
+        chunks_path = os.path.join(UPLOAD_DIR, base_name + "_chunks.json")
+        embeddings_path = os.path.join(UPLOAD_DIR, base_name + "_chunks_embedded.json")
+        index_path = os.path.join(UPLOAD_DIR, base_name + "_chunks_embedded.index")
 
-    # 1. Save video
-    with open(video_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+        logger.info(f"Initiating upload for video: {file.filename}")
 
-    file_hash = get_file_hash(video_path)
+        # 1. Save video
+        with open(video_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
 
-    # Check if duplicate already indexed
-    catalog = load_catalog()
-    existing = next(
-        (v for v in catalog if v.get("filename") == file.filename or (file_hash and v.get("file_hash") == file_hash)),
-        None
-    )
-    if (
-        existing
-        and existing.get("status") == "ready"
-        and existing.get("embeddings_path")
-        and os.path.exists(existing.get("embeddings_path", ""))
-        and existing.get("faiss_index_path")
-        and os.path.exists(existing.get("faiss_index_path", ""))
-    ):
-        print(f"Video {file.filename} already indexed. Returning cached metadata.")
-        return {
-            **existing,
-            "message": "Video RAG indexing completed successfully! (cached)"
+        file_hash = get_file_hash(video_path)
+
+        # Check if duplicate already indexed
+        catalog = load_catalog()
+        existing = next(
+            (v for v in catalog if v.get("filename") == file.filename or (file_hash and v.get("file_hash") == file_hash)),
+            None
+        )
+        if (
+            existing
+            and existing.get("status") == "ready"
+            and existing.get("embeddings_path")
+            and os.path.exists(existing.get("embeddings_path", ""))
+            and existing.get("faiss_index_path")
+            and os.path.exists(existing.get("faiss_index_path", ""))
+        ):
+            logger.info(f"Video {file.filename} already indexed. Returning cached metadata.")
+            print(f"Video {file.filename} already indexed. Returning cached metadata.")
+            return {
+                **existing,
+                "message": "Video RAG indexing completed successfully! (cached)"
+            }
+
+        # 2. Extract audio with FFmpeg
+        if os.path.exists(audio_path):
+            logger.info("Audio already exists. Skipping FFmpeg.")
+            print("Audio already exists. Skipping FFmpeg.")
+        else:
+            logger.info(f"Extracting audio from {video_path}...")
+            print("Extracting audio...")
+            try:
+                subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-nostdin",
+                        "-i",
+                        video_path,
+                        "-vn",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        "-y",
+                        audio_path
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    stdin=subprocess.DEVNULL
+                )
+            except subprocess.CalledProcessError as ff_err:
+                logger.error(f"FFmpeg audio extraction failed (exit {ff_err.returncode}): {ff_err.stderr}")
+                raise RuntimeError(f"FFmpeg audio extraction failed: {ff_err.stderr or ff_err}") from ff_err
+
+        # 3. Whisper speech-to-text
+        logger.info(f"Starting Whisper transcription for {audio_path}...")
+        json_path = transcribe_audio(audio_path)
+
+        # 4. Chunking
+        logger.info(f"Generating chunks for {json_path}...")
+        chunks_path = create_chunks(json_path)
+
+        # 5. Embeddings
+        logger.info(f"Generating embeddings for {chunks_path}...")
+        embeddings_path = create_embeddings(chunks_path)
+
+        # 6. FAISS index
+        logger.info(f"Creating FAISS vector index for {embeddings_path}...")
+        index_path = create_faiss_index(embeddings_path)
+
+        # 7. Register in persistent library catalog
+        video_entry = {
+            "id": f"vid_{base_name}",
+            "filename": file.filename,
+            "title": file.filename,
+            "video_path": video_path,
+            "audio_path": audio_path,
+            "transcript_path": json_path,
+            "chunks_path": chunks_path,
+            "embeddings_path": embeddings_path,
+            "faiss_index_path": index_path,
+            "file_hash": file_hash,
+            "file_size": os.path.getsize(video_path) if os.path.exists(video_path) else 0,
+            "status": "ready",
+            "created_at": time.time()
         }
 
-    # 2. Extract audio with FFmpeg
-    if os.path.exists(audio_path):
-        print("Audio already exists. Skipping FFmpeg.")
-    else:
-        print("Extracting audio...")
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-i",
-                video_path,
-                "-vn",
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                "-y",
-                audio_path
-            ],
-            check=True
+        catalog = [v for v in catalog if v.get("filename") != file.filename and v.get("id") != video_entry["id"]]
+        catalog.append(video_entry)
+        save_catalog(catalog)
+
+        logger.info(f"Video {file.filename} processing and cataloging complete.")
+        return {
+            **video_entry,
+            "message": "Video RAG indexing completed successfully!"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Unhandled error during video upload processing for {getattr(file, 'filename', 'unknown')}: {e}")
+        safe_detail = sanitize_error_detail(e)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Video processing failed: {safe_detail}"
         )
-
-    # 3. Whisper speech-to-text
-    json_path = transcribe_audio(audio_path)
-
-    # 4. Chunking
-    chunks_path = create_chunks(json_path)
-
-    # 5. Embeddings
-    embeddings_path = create_embeddings(chunks_path)
-
-    # 6. FAISS index
-    index_path = create_faiss_index(embeddings_path)
-
-    # 7. Register in persistent library catalog
-    video_entry = {
-        "id": f"vid_{base_name}",
-        "filename": file.filename,
-        "title": file.filename,
-        "video_path": video_path,
-        "audio_path": audio_path,
-        "transcript_path": json_path,
-        "chunks_path": chunks_path,
-        "embeddings_path": embeddings_path,
-        "faiss_index_path": index_path,
-        "file_hash": file_hash,
-        "file_size": os.path.getsize(video_path) if os.path.exists(video_path) else 0,
-        "status": "ready",
-        "created_at": time.time()
-    }
-
-    catalog = [v for v in catalog if v.get("filename") != file.filename and v.get("id") != video_entry["id"]]
-    catalog.append(video_entry)
-    save_catalog(catalog)
-
-    return {
-        **video_entry,
-        "message": "Video RAG indexing completed successfully!"
-    }
 
 
 # =========================================================
@@ -384,6 +433,7 @@ async def process_video_link(
             detail="Video URL cannot be empty."
         )
 
+    logger.info(f"Downloading video from link: {url}")
     print(f"Downloading video from link: {url}")
 
     ydl_opts = {
@@ -413,97 +463,124 @@ async def process_video_link(
                     filename = os.path.basename(video_path)
 
     except Exception as e:
+        logger.exception(f"Error downloading video from link {url}: {e}")
         print(f"Error downloading video: {e}")
         raise HTTPException(
             status_code=400,
-            detail=f"Failed to download video: {str(e)}"
+            detail=f"Failed to download video: {sanitize_error_detail(e)}"
         )
 
-    base_name = os.path.splitext(filename)[0]
-    audio_path = os.path.join(UPLOAD_DIR, base_name + ".wav")
-    json_path = os.path.join(UPLOAD_DIR, base_name + ".json")
-    chunks_path = os.path.join(UPLOAD_DIR, base_name + "_chunks.json")
-    embeddings_path = os.path.join(UPLOAD_DIR, base_name + "_chunks_embedded.json")
-    index_path = os.path.join(UPLOAD_DIR, base_name + "_chunks_embedded.index")
+    try:
+        base_name = os.path.splitext(filename)[0]
+        audio_path = os.path.join(UPLOAD_DIR, base_name + ".wav")
+        json_path = os.path.join(UPLOAD_DIR, base_name + ".json")
+        chunks_path = os.path.join(UPLOAD_DIR, base_name + "_chunks.json")
+        embeddings_path = os.path.join(UPLOAD_DIR, base_name + "_chunks_embedded.json")
+        index_path = os.path.join(UPLOAD_DIR, base_name + "_chunks_embedded.index")
 
-    file_hash = get_file_hash(video_path)
+        file_hash = get_file_hash(video_path)
 
-    # Check if duplicate already indexed
-    catalog = load_catalog()
-    existing = next(
-        (v for v in catalog if v.get("filename") == filename or (file_hash and v.get("file_hash") == file_hash)),
-        None
-    )
-    if (
-        existing
-        and existing.get("status") == "ready"
-        and existing.get("embeddings_path")
-        and os.path.exists(existing.get("embeddings_path", ""))
-        and existing.get("faiss_index_path")
-        and os.path.exists(existing.get("faiss_index_path", ""))
-    ):
-        print(f"Link video {filename} already indexed. Returning cached metadata.")
-        return {
-            **existing,
-            "message": "Video link downloaded and indexed successfully! (cached)"
+        # Check if duplicate already indexed
+        catalog = load_catalog()
+        existing = next(
+            (v for v in catalog if v.get("filename") == filename or (file_hash and v.get("file_hash") == file_hash)),
+            None
+        )
+        if (
+            existing
+            and existing.get("status") == "ready"
+            and existing.get("embeddings_path")
+            and os.path.exists(existing.get("embeddings_path", ""))
+            and existing.get("faiss_index_path")
+            and os.path.exists(existing.get("faiss_index_path", ""))
+        ):
+            logger.info(f"Link video {filename} already indexed. Returning cached metadata.")
+            print(f"Link video {filename} already indexed. Returning cached metadata.")
+            return {
+                **existing,
+                "message": "Video link downloaded and indexed successfully! (cached)"
+            }
+
+        # 1. FFmpeg
+        if not os.path.exists(audio_path):
+            logger.info(f"Extracting audio with FFmpeg to {audio_path}...")
+            print("Extracting audio with FFmpeg...")
+            try:
+                subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-nostdin",
+                        "-i",
+                        video_path,
+                        "-vn",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        "-y",
+                        audio_path
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    stdin=subprocess.DEVNULL
+                )
+            except subprocess.CalledProcessError as ff_err:
+                logger.error(f"FFmpeg audio extraction failed (exit {ff_err.returncode}): {ff_err.stderr}")
+                raise RuntimeError(f"FFmpeg audio extraction failed: {ff_err.stderr or ff_err}") from ff_err
+
+        # 2. Whisper
+        logger.info(f"Starting Whisper transcription for {audio_path}...")
+        json_path = transcribe_audio(audio_path)
+
+        # 3. Chunking
+        logger.info(f"Generating chunks for {json_path}...")
+        chunks_path = create_chunks(json_path)
+
+        # 4. Embeddings
+        logger.info(f"Generating embeddings for {chunks_path}...")
+        embeddings_path = create_embeddings(chunks_path)
+
+        # 5. FAISS
+        logger.info(f"Building FAISS vector index for {embeddings_path}...")
+        index_path = create_faiss_index(embeddings_path)
+
+        # 6. Register in persistent catalog
+        video_entry = {
+            "id": f"vid_{base_name}",
+            "filename": filename,
+            "title": filename,
+            "video_path": video_path,
+            "audio_path": audio_path,
+            "transcript_path": json_path,
+            "chunks_path": chunks_path,
+            "embeddings_path": embeddings_path,
+            "faiss_index_path": index_path,
+            "file_hash": file_hash,
+            "file_size": os.path.getsize(video_path) if os.path.exists(video_path) else 0,
+            "status": "ready",
+            "created_at": time.time()
         }
 
-    # 1. FFmpeg
-    if not os.path.exists(audio_path):
-        print("Extracting audio with FFmpeg...")
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-i",
-                video_path,
-                "-vn",
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                "-y",
-                audio_path
-            ],
-            check=True
+        catalog = [v for v in catalog if v.get("filename") != filename and v.get("id") != video_entry["id"]]
+        catalog.append(video_entry)
+        save_catalog(catalog)
+
+        logger.info(f"Link video {filename} processing complete.")
+        return {
+            **video_entry,
+            "message": "Video link downloaded and indexed successfully!"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Unhandled error during link video processing for {filename}: {e}")
+        safe_detail = sanitize_error_detail(e)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Video processing failed: {safe_detail}"
         )
-
-    # 2. Whisper
-    json_path = transcribe_audio(audio_path)
-
-    # 3. Chunking
-    chunks_path = create_chunks(json_path)
-
-    # 4. Embeddings
-    embeddings_path = create_embeddings(chunks_path)
-
-    # 5. FAISS
-    index_path = create_faiss_index(embeddings_path)
-
-    # 6. Register in persistent catalog
-    video_entry = {
-        "id": f"vid_{base_name}",
-        "filename": filename,
-        "title": filename,
-        "video_path": video_path,
-        "audio_path": audio_path,
-        "transcript_path": json_path,
-        "chunks_path": chunks_path,
-        "embeddings_path": embeddings_path,
-        "faiss_index_path": index_path,
-        "file_hash": file_hash,
-        "file_size": os.path.getsize(video_path) if os.path.exists(video_path) else 0,
-        "status": "ready",
-        "created_at": time.time()
-    }
-
-    catalog = [v for v in catalog if v.get("filename") != filename and v.get("id") != video_entry["id"]]
-    catalog.append(video_entry)
-    save_catalog(catalog)
-
-    return {
-        **video_entry,
-        "message": "Video link downloaded and indexed successfully!"
-    }
 
 
 # =========================================================
