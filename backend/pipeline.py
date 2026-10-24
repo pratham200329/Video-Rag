@@ -2,7 +2,6 @@ import os
 import json
 import subprocess
 
-import faiss
 import numpy as np
 from dotenv import load_dotenv
 from groq import (
@@ -14,8 +13,6 @@ from groq import (
     APITimeoutError,
 )
 
-from sentence_transformers import SentenceTransformer
-
 # Load environment variables
 load_dotenv()
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"))
@@ -23,12 +20,45 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 
 # =========================================================
-# EMBEDDING MODEL
+# LAZY-LOADED AI MODELS & LIBRARIES (MEMORY OPTIMIZATION)
 # =========================================================
 
-embedding_model = SentenceTransformer(
-    "all-MiniLM-L6-v2"
-)
+_embedding_model = None
+_faiss = None
+
+
+def get_embedding_model():
+    """Lazily load and cache the SentenceTransformer embedding model."""
+    global _embedding_model
+    if _embedding_model is None:
+        import torch
+        # Cap PyTorch thread pools to prevent memory spikes on constrained instances (e.g. Render 512MiB)
+        try:
+            torch.set_num_threads(1)
+            torch.set_num_interop_threads(1)
+        except Exception:
+            pass
+        from sentence_transformers import SentenceTransformer
+        _embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+    return _embedding_model
+
+
+def get_faiss():
+    """Lazily load and cache the FAISS library."""
+    global _faiss
+    if _faiss is None:
+        import faiss
+        _faiss = faiss
+    return _faiss
+
+
+def __getattr__(name: str):
+    """Backward compatibility for direct access to pipeline.embedding_model or pipeline.faiss."""
+    if name == "embedding_model":
+        return get_embedding_model()
+    if name == "faiss":
+        return get_faiss()
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
 # =========================================================
@@ -247,7 +277,8 @@ def create_embeddings(chunks_path):
     ]
 
 
-    embeddings = embedding_model.encode(
+    model = get_embedding_model()
+    embeddings = model.encode(
         texts,
         show_progress_bar=True
     )
@@ -340,6 +371,7 @@ def create_faiss_index(
     dimension = vectors.shape[1]
 
 
+    faiss = get_faiss()
     index = faiss.IndexFlatL2(
         dimension
     )
@@ -388,6 +420,7 @@ def retrieve_chunks(
 
     # Load FAISS
 
+    faiss = get_faiss()
     index = faiss.read_index(
         index_path
     )
@@ -406,8 +439,9 @@ def retrieve_chunks(
 
     # Question embedding
 
+    model = get_embedding_model()
     question_embedding = (
-        embedding_model.encode(
+        model.encode(
             [question]
         )
     )
@@ -480,9 +514,11 @@ def retrieve_global_chunks(
         return []
 
     # Encode question once to optimize speed
-    question_embedding = embedding_model.encode([question])
+    model = get_embedding_model()
+    question_embedding = model.encode([question])
     question_embedding = np.array(question_embedding, dtype="float32")
 
+    faiss = get_faiss()
     all_results = []
 
     for video in ready_videos:
